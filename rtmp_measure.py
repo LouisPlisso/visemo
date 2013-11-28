@@ -20,17 +20,21 @@ import re
 import time
 import sqlite3
 import getpass
+import struct
 
 from cloudkey_nocurl import CloudKey
 
 import rtmplite.rtmpclient
 import rtmplite.multitask
-from rtmplite.rtmp import Command
+from rtmplite.rtmp import Command, Header, Message
 MESSAGE_RPC = 0x14
 import socket
 
 DATABASE_CONNECTION = None
 DATABASE_CURSOR = None
+DATABASE_FIELDS = ('rtmp_url', 'start_web_scrap', 'end_web_scrap',
+                   'start_stream_page', 'end_stream_page',
+                   'start', 'end', 'duration')
 
 DURATION = 60
 TIMEOUT = 10
@@ -152,8 +156,10 @@ def my_connect(self, url, timeout=None, my_parse=True, *args):
 
 rtmplite.rtmpclient.NetConnection.connect = my_connect
 
-def measure(rtmp_url):
+def measure(rtmp_url, ext='', result_dict={}):
     '''Modified version of the rtmpclient.connect function'''
+    result_dict[ext]['rtmp_url'] = rtmp_url
+    result_dict[ext]['start_measure'] = time.time()
     net_connection = yield rtmplite.rtmpclient.NetConnection()
     net_connection.data = rtmplite.rtmpclient.Object(
                                                     flashVer='LNX 11,9,900,152',
@@ -173,11 +179,26 @@ def measure(rtmp_url):
                                             params='',
                                             fragment='')
     result = yield net_connection.connect(new_url.geturl(), TIMEOUT)
+    win_ack = Message()
+    win_ack.time = net_connection.client.relativeTime
+    win_ack.type = Message.WIN_ACK_SIZE
+    win_ack.data = struct.pack('>L', net_connection.client.readWinSize)
+    yield net_connection.client.writeMessage(win_ack)
     net_stream = yield rtmplite.rtmpclient.NetStream().create(net_connection,
                                                               timeout=TIMEOUT)
     if not net_stream:
         LOG.debug('Failed to create stream')
         raise StopIteration, 'Failed to create stream'
+    header = Header()
+    fmt = 1
+    channel = 2
+    header.hdrdata = struct.pack('>hh', fmt * 256, channel)
+    set_buf_len = Message(hdr=header)
+    # for these messages we use a timestamp delta
+    set_buf_len.time = 0
+    set_buf_len.type = Message.USER_CONTROL
+    set_buf_len.data = struct.pack('>H', 3)
+    yield net_connection.client.writeMessage(set_buf_len)
     play_id = '?'.join((parsed_url.path.split('/live-dc/')[1],
                         parsed_url.query))
     result = yield net_stream.play(play_id, timeout=TIMEOUT)
@@ -188,21 +209,54 @@ def measure(rtmp_url):
     # if the remote side terminates before duration,
     LOG.info('starting playback for duration: %d', DURATION)
     start = time.time()
+    result_dict[ext]['start'] = start
+    LOG.debug('start: %s', start)
     try:
         yield net_connection.client.close_queue.get(timeout=DURATION)
         LOG.debug('received connection close')
     except (rtmplite.multitask.Timeout, GeneratorExit):
         # else wait until duration
-        LOG.info('duration completed, connect closing')
+        LOG.info('Duration finished')
         yield net_connection.close()
-    finally:
-        end = time.time()
-        LOG.debug('start, end, duration: (%s, %s, %s)', start, end, end - start)
-        put_result_db(rtmp_url, start, end, end - start)
+    except Exception, mes:
+        LOG.exception(mes)
+        LOG.info('Unexpected exit')
+    end = time.time()
+    result_dict[ext]['end'] = end
+    result_dict[ext]['duration'] = end - start
+    LOG.debug('end: %s', end)
+    LOG.debug('start, end, duration: (%s, %s, %s)', start, end, end - start)
+    put_result_db(result_dict, ext)
 
-def web_scrap(url, store, password=None, ext=''):
+#    end = time.time()
+#    while end - start < DURATION:
+#        try:
+#            yield net_connection.client.queue.get(timeout=2)
+#            #yield net_connection.client.queue.get(timeout=DURATION)
+#            #yield net_connection.client.close_queue.get(timeout=DURATION)
+#            LOG.debug('received connection close')
+#        except (rtmplite.multitask.Timeout, GeneratorExit):
+#            # else wait until duration
+#            LOG.info('Normal exit')
+#        except KeyboardInterrupt:
+#            LOG.info('KeyboardInterrupt')
+#            break
+#        except Exception, mes:
+#            LOG.exception(mes)
+#            LOG.info('Unexpected exit')
+#        end = time.time()
+#        LOG.debug('end: %s', end)
+#    if net_connection:
+#        yield net_connection.close()
+#    LOG.debug('start, end, duration: (%s, %s, %s)', start, end, end - start)
+#    put_result_db(rtmp_url, start, end, end - start)
+
+def web_scrap(url, store, password=None, ext='', result_dict={}):
     '''Parse the front-end page to get to video'''
     LOG.info('Start working with url: %s', url)
+    if ext not in result_dict:
+        result_dict[ext] = {}
+    result_dict[ext]['start_web_scrap'] = time.time()
     opener = urllib2.build_opener()
     opener.addheaders = [MOZILLA_HEADERS]
     embedding_page = yield opener.open(url)
@@ -248,9 +302,10 @@ def web_scrap(url, store, password=None, ext=''):
     if len(live_url_groups) != 1:
         raise StopIteration, 'ambiguity on the live url'
     LOG.debug('live_url_groups: %s' % live_url_groups)
-    yield retrieve_rtmp(live_url_groups[0], store, ext)
+    result_dict[ext]['end_web_scrap'] = time.time()
+    yield retrieve_rtmp(live_url_groups[0], store, ext, result_dict)
 
-def retrieve_rtmp(live_url, store, ext=''):
+def retrieve_rtmp(live_url, store, ext='', result_dict={}):
     '''Retrieve the rtmp url'''
     LOG.debug('Start working with live_url: %s' % live_url)
     match = re.match(MATCHER_LIVE_URL, live_url)
@@ -278,6 +333,7 @@ def retrieve_rtmp(live_url, store, ext=''):
         LOG.critical('could not find stream_url')
         raise StopIteration, 'could not find stream_url'
     LOG.debug('found stream url: %s', stream_url)
+    result_dict[ext]['start_stream_page'] = time.time()
     stream_page = yield urllib2.urlopen(stream_url)
     soup = BeautifulSoup(stream_page)
     if store:
@@ -289,24 +345,27 @@ def retrieve_rtmp(live_url, store, ext=''):
         LOG.critical('could not find rtmp_url')
         raise StopIteration, 'could not find rtmp_url'
     LOG.info('rtmp_url: %s', rtmp_url)
-    yield measure(rtmp_url)
+    result_dict[ext]['end_stream_page'] = time.time()
+    yield measure(rtmp_url, ext, result_dict)
 
 def create_db():
     '''Set the database for the results'''
     global DATABASE_CONNECTION, DATABASE_CURSOR
     DATABASE_CONNECTION = sqlite3.connect(':memory:')
     DATABASE_CURSOR = DATABASE_CONNECTION.cursor()
-    DATABASE_CURSOR.execute('''CREATE TABLE results (url, start, end, duration)''')
+    DATABASE_CURSOR.execute('CREATE TABLE results ('
+                            + ', '.join(DATABASE_FIELDS) + ')')
 
-def put_result_db(*results):
+def put_result_db(result_dict, ext):
     '''Put the result in database'''
-    DATABASE_CURSOR.execute('''INSERT INTO results VALUES (?, ?, ?, ?)''',
-                            results)
+    DATABASE_CURSOR.execute('INSERT INTO results VALUES ('
+                            + '?, ' * (len(DATABASE_FIELDS) - 1) + '? )',
+                            [result_dict[ext][key] for key in DATABASE_FIELDS])
 
 def output_db_results():
     '''Print the results from the database'''
     DATABASE_CONNECTION.commit()
-    with open(OUTPUT_FILE, 'w') as output_file:
+    with open(OUTPUT_FILE, 'a') as output_file:
         for row in DATABASE_CURSOR.execute('''SELECT * FROM results'''):
             print(row, file=output_file)
     DATABASE_CONNECTION.close()
@@ -384,7 +443,8 @@ def main(argv=None):
         rtmplite.rtmpclient._debug = True
     if args.output_file:
         try:
-            with open(args.output_file, 'w') as _:
+            with open(args.output_file, 'w') as output_file:
+                print(DATABASE_FIELDS, file=output_file)
                 OUTPUT_FILE = args.output_file
         except IOError, mes:
             LOG.exception(mes)
