@@ -186,14 +186,14 @@ def measure(rtmp_url):
         yield net_connection.close()
         raise StopIteration, 'Failed to play stream %r' % play_id
     # if the remote side terminates before duration,
-    LOG.debug('duration: %d', DURATION)
+    LOG.info('starting playback for duration: %d', DURATION)
     start = time.time()
     try:
         yield net_connection.client.close_queue.get(timeout=DURATION)
         LOG.debug('received connection close')
     except (rtmplite.multitask.Timeout, GeneratorExit):
         # else wait until duration
-        LOG.debug('duration completed, connect closing')
+        LOG.info('duration completed, connect closing')
         yield net_connection.close()
     finally:
         end = time.time()
@@ -202,7 +202,7 @@ def measure(rtmp_url):
 
 def web_scrap(url, store, password=None, ext=''):
     '''Parse the front-end page to get to video'''
-    LOG.debug('Start working with url: %s', url)
+    LOG.info('Start working with url: %s', url)
     opener = urllib2.build_opener()
     opener.addheaders = [MOZILLA_HEADERS]
     embedding_page = yield opener.open(url)
@@ -288,7 +288,7 @@ def retrieve_rtmp(live_url, store, ext=''):
         LOG.exception(mes)
         LOG.critical('could not find rtmp_url')
         raise StopIteration, 'could not find rtmp_url'
-    LOG.debug('rtmp_url: %s', rtmp_url)
+    LOG.info('rtmp_url: %s', rtmp_url)
     yield measure(rtmp_url)
 
 def create_db():
@@ -319,7 +319,7 @@ def output_db_results(out_file=sys.stdout):
 def launch_measure(url, store, nb_users=NB_USERS, password=None):
     '''Put the measure function in the multitask queue'''
     create_db()
-    LOG.debug('launching %d users' % nb_users)
+    LOG.info('launching %d users' % nb_users)
     for index in range(nb_users):
         rtmplite.multitask.add(web_scrap(url, store, password,
                                            ext=('_%d' % index)))
