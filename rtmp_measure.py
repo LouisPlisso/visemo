@@ -41,7 +41,7 @@ RTMP_PORT = 1935
 RTMP_PING_SIZE = 1536
 
 API_KEY = None
-
+OUTPUT_FILE = None
 
 MATCHER_LIVE_URL = (r'^(\w*)(://cdn.dmcloud.net/route/)(\w*/)(\w{24})/(\w{24})/'
                 r'(live_1.m3u8\?auth=)(\d{10})-(\d)-(\w{8})-(\w{32})(?:-\w*)?$')
@@ -303,11 +303,12 @@ def put_result_db(*results):
     DATABASE_CURSOR.execute('''INSERT INTO results VALUES (?, ?, ?, ?)''',
                             results)
 
-def output_db_results(out_file=sys.stdout):
+def output_db_results():
     '''Print the results from the database'''
     DATABASE_CONNECTION.commit()
-    for row in DATABASE_CURSOR.execute('''SELECT * FROM results'''):
-        print(row, file=out_file)
+    with open(OUTPUT_FILE, 'w') as output_file:
+        for row in DATABASE_CURSOR.execute('''SELECT * FROM results'''):
+            print(row, file=output_file)
     DATABASE_CONNECTION.close()
 
 #def process_url(url, store, password, ext):
@@ -337,7 +338,7 @@ def main(argv=None):
     'Program wrapper'
     if argv is None:
         argv = sys.argv[1:]
-    global DURATION, TIMEOUT, API_KEY
+    global DURATION, TIMEOUT, API_KEY, OUTPUT_FILE
     parser = argparse.ArgumentParser()
     parser.add_argument('--version', action='version', version=VERSION)
     parser.add_argument('--debug', dest='debug', action='store_true',
@@ -368,6 +369,8 @@ def main(argv=None):
                         type=int, default=NB_USERS,
                         help=('Number of users to simulate (default %d)'
                               % NB_USERS))
+    parser.add_argument('-o', '--output-file', dest='output_file',
+                        default=None, help='output file (default stdout)')
     parser.add_argument('url', help='url of the embedding page')
     args = parser.parse_args(argv)
     if args.quiet and args.verbose:
@@ -379,6 +382,19 @@ def main(argv=None):
     if args.debug:
         LOG.setLevel(logging.DEBUG)
         rtmplite.rtmpclient._debug = True
+    if args.output_file:
+        try:
+            with open(args.output_file, 'w') as _:
+                OUTPUT_FILE = args.output_file
+        except IOError, mes:
+            LOG.exception(mes)
+            LOG.error('Cannot open file %s for writing output',
+                      args.output_file)
+            args.output_file = None
+            LOG.error('Using stdout for output')
+            OUTPUT_FILE = '/dev/stdout'
+    else:
+        OUTPUT_FILE = '/dev/stdout'
     API_KEY = args.api_key
     DURATION = args.duration
     TIMEOUT = args.timeout
